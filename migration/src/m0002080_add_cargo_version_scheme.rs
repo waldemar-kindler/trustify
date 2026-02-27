@@ -9,7 +9,7 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "INSERT INTO public.version_scheme VALUES ('cargo', 'Cargo crates.io', 'https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html')",
+                "INSERT INTO public.version_scheme VALUES ('cargo', 'Cargo crates.io', 'https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html') ON CONFLICT DO NOTHING",
             )
             .await
             .map(|_| ())?;

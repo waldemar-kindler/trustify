@@ -18,6 +18,7 @@ use sea_orm::{
 };
 use sea_orm_migration::{IntoSchemaManagerConnection, SchemaManagerConnection};
 use std::{
+    fmt::Display,
     ops::{Deref, DerefMut},
     pin::Pin,
     time::Duration,
@@ -30,6 +31,8 @@ pub trait DatabaseErrors {
     fn is_duplicate(&self) -> bool;
     /// return `true` if the error means the connection is read-only
     fn is_read_only(&self) -> bool;
+    /// return `true` if the error is a foreign key constraint violation
+    fn is_foreign_key_violation(&self) -> bool;
 }
 
 impl DatabaseErrors for DbErr {
@@ -48,6 +51,16 @@ impl DatabaseErrors for DbErr {
             DbErr::Query(RuntimeErr::SqlxError(sqlx::error::Error::Database(err)))
             | DbErr::Exec(RuntimeErr::SqlxError(sqlx::error::Error::Database(err))) => {
                 err.code().as_deref() == Some("25006")
+            }
+            _ => false,
+        }
+    }
+
+    fn is_foreign_key_violation(&self) -> bool {
+        match self {
+            DbErr::Query(RuntimeErr::SqlxError(sqlx::error::Error::Database(err)))
+            | DbErr::Exec(RuntimeErr::SqlxError(sqlx::error::Error::Database(err))) => {
+                err.is_foreign_key_violation()
             }
             _ => false,
         }
@@ -111,6 +124,53 @@ impl Database {
 
     pub fn into_connection(self) -> DatabaseConnection {
         self.db
+    }
+
+    #[instrument(skip_all, err(level=tracing::Level::INFO))]
+    pub async fn transaction_with_config<T, E, F>(
+        &self,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+        f: F,
+    ) -> Result<T, E>
+    where
+        F: AsyncFnOnce(&DatabaseTransaction) -> Result<T, E>,
+        E: From<DbErr> + Display,
+    {
+        let tx = self
+            .db
+            .begin_with_config(isolation_level, access_mode)
+            .await?;
+        match f(&tx).await {
+            // the user function succeeded
+            Ok(result) => {
+                tx.commit().await?;
+                Ok(result)
+            }
+            // the user function failed
+            Err(err) => {
+                log::debug!("Function returned with an error: {err}");
+                match tx.rollback().await {
+                    // we rolled back, but still have the original error to report
+                    Ok(_) => Err(err),
+                    // we failed rolling back, propagate that state, but log the now omitted,
+                    // original error.
+                    Err(rollback_err) => {
+                        log::warn!("Rollback failed, suppressing original error: {err}");
+                        Err(rollback_err.into())
+                    }
+                }
+            }
+        }
+    }
+
+    #[instrument(skip_all, err(level=tracing::Level::INFO))]
+    pub async fn transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: AsyncFnOnce(&DatabaseTransaction) -> Result<T, E>,
+        E: From<DbErr> + Display,
+    {
+        self.transaction_with_config(None, None, f).await
     }
 }
 

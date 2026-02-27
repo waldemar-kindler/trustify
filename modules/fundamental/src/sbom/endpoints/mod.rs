@@ -19,13 +19,15 @@ use crate::{
             SbomExternalPackageReference, SbomNodeReference, SbomPackage, SbomPackageRelation,
             SbomSummary, Which, details::SbomAdvisory,
         },
-        service::SbomService,
+        service::{SbomService, sbom::FetchOptions},
     },
+    sbom_group::service::SbomGroupService,
 };
 use actix_web::{HttpResponse, Responder, delete, get, http::header, post, web};
 use config::Config;
 use futures_util::TryStreamExt;
 use sea_orm::{TransactionTrait, prelude::Uuid};
+use serde_qs::actix::QsQuery;
 use std::str::FromStr;
 use trustify_auth::{
     CreateSbom, DeleteSbom, Permission, ReadAdvisory, ReadSbom, all,
@@ -147,6 +149,15 @@ pub async fn get_license_export(
     }
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct GroupFilterQuery {
+    /// Filter by group IDs. Only SBOMs assigned to any of the provided groups will be returned.
+    /// Can be specified multiple times. Malformed IDs are silently ignored.
+    #[serde(default)]
+    group: Vec<String>,
+}
+
 /// List SBOMs
 #[utoipa::path(
     tag = "sbom",
@@ -154,6 +165,7 @@ pub async fn get_license_export(
     params(
         Query,
         Paginated,
+        GroupFilterQuery,
     ),
     responses(
         (status = 200, description = "Matching SBOMs", body = PaginatedResults<SbomSummary>),
@@ -165,13 +177,19 @@ pub async fn all(
     db: web::Data<Database>,
     web::Query(search): web::Query<Query>,
     web::Query(paginated): web::Query<Paginated>,
+    QsQuery(group_filter): QsQuery<GroupFilterQuery>,
     authorizer: web::Data<Authorizer>,
     user: UserInformation,
 ) -> actix_web::Result<impl Responder> {
     authorizer.require(&user, Permission::ReadSbom)?;
 
     let tx = db.begin_read().await?;
-    let result = fetch.fetch_sboms(search, paginated, (), &tx).await?;
+    let mut options = FetchOptions::default();
+    if !group_filter.group.is_empty() {
+        options = options.groups(group_filter.group);
+    }
+
+    let result = fetch.fetch_sboms(search, paginated, options, &tx).await?;
 
     Ok(HttpResponse::Ok().json(result))
 }
@@ -447,6 +465,13 @@ struct UploadQuery {
     #[serde(default)]
     #[param(inline)]
     cache: Cache,
+
+    /// Optional group IDs to assign the SBOM to after ingestion.
+    ///
+    /// If one or more group IDs are invalid, the upload will fail with 400 Bad Request
+    /// and the SBOM will not be ingested.
+    #[serde(default)]
+    group: Vec<String>,
 }
 
 const fn default_format() -> Format {
@@ -463,24 +488,52 @@ const fn default_format() -> Format {
     responses(
         (status = 201, description = "Upload an SBOM", body = IngestResult),
         (status = 400, description = "The file could not be parsed as an SBOM"),
+        (status = 400, description = "One or more group IDs are invalid or do not exist"),
     )
 )]
 #[post("/v2/sbom")]
+#[allow(clippy::too_many_arguments)]
 /// Upload a new SBOM
 pub async fn upload(
-    service: web::Data<IngestorService>,
+    ingestor: web::Data<IngestorService>,
+    sbom_group: web::Data<SbomGroupService>,
     config: web::Data<Config>,
-    web::Query(UploadQuery {
+    db: web::Data<Database>,
+    QsQuery(UploadQuery {
         labels,
         format,
         cache,
-    }): web::Query<UploadQuery>,
+        group,
+    }): QsQuery<UploadQuery>,
     content_type: Option<web::Header<header::ContentType>>,
     bytes: web::Bytes,
     _: Require<CreateSbom>,
 ) -> Result<impl Responder, Error> {
     let bytes = decompress_async(bytes, content_type.map(|ct| ct.0), config.upload_limit).await??;
-    let result = service.ingest(&bytes, format, labels, None, cache).await?;
+
+    let result = db
+        .transaction(async |tx| {
+            let mut result = ingestor
+                .ingest(&bytes, format, labels, None, cache, tx)
+                .await
+                .map_err(Error::Ingestor)?;
+
+            if !group.is_empty() {
+                sbom_group
+                    .update_assignments(&result.id, None, group, tx)
+                    .await?;
+            }
+
+            // Rewrite ID to have the prefix: Although the field is "id" it always carried the ID,
+            // but with the `urn:uuid:` prefix. Which was used for "key" fields. Which accepted
+            // for than the actual ID. The whole naming is flawed and confusing. But in order to
+            // keep the API stable, we need to return the ID with the prefix.
+            result.id = format!("urn:uuid:{}", result.id);
+
+            Ok::<_, Error>(result)
+        })
+        .await?;
+
     log::info!("Uploaded SBOM: {}", result.id);
     Ok(HttpResponse::Created().json(result))
 }

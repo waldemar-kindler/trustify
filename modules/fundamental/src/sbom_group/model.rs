@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
+use trustify_common::model::PaginatedResults;
 use trustify_entity::{labels::Labels, sbom_group};
 use utoipa::ToSchema;
 
@@ -8,12 +9,16 @@ pub struct Group {
     /// The ID of the group
     pub id: String,
 
-    /// The parent of this group
+    /// The direct parent of this group
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
 
     /// The name of the group, in the context of its parent
     pub name: String,
+
+    /// A user friendly description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     /// Additional group labels
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
@@ -26,6 +31,7 @@ impl From<sbom_group::Model> for Group {
             id: value.id.to_string(),
             parent: value.parent.map(|id| id.to_string()),
             name: value.name,
+            description: value.description,
             labels: value.labels,
         }
     }
@@ -71,11 +77,39 @@ impl DerefMut for GroupDetails {
 /// Mutable properties of a [`Group`].
 #[derive(Serialize, Deserialize, Debug, Clone, ToSchema, PartialEq, Eq)]
 pub struct GroupRequest {
+    /// The name of the group.
     pub name: String,
 
+    /// The ID of the group's parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
 
+    /// A user provided description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
     pub labels: Labels,
+}
+
+/// Result of listing SBOM groups, with optional resolved parent references.
+#[derive(Serialize, Deserialize, Debug, Clone, ToSchema, PartialEq, Eq)]
+pub struct GroupListResult {
+    #[serde(flatten)]
+    pub result: PaginatedResults<GroupDetails>,
+
+    /// Groups referenced by parent chains but not present in the primary result set.
+    ///
+    /// Only present when `parents=resolve` is requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referenced: Option<Vec<Group>>,
+}
+
+/// Request to assign multiple SBOMs to the same set of groups.
+#[derive(Serialize, Deserialize, Debug, Clone, ToSchema, PartialEq, Eq)]
+pub struct BulkAssignmentRequest {
+    /// The IDs of the SBOMs to update.
+    pub sbom_ids: Vec<String>,
+    /// The group IDs to assign to each SBOM (replaces existing assignments).
+    pub group_ids: Vec<String>,
 }
